@@ -72,6 +72,51 @@ def test_thread(testdir):
     assert "++ Timeout ++" in result.stderr.lines[-1]
 
 
+@have_sigalrm
+def test_both_soft(testdir):
+    testdir.makepyfile(
+        """
+        import time
+
+        def test_foo():
+            time.sleep(2)
+        """
+    )
+    result = testdir.runpytest("--timeout=1")
+    result.stdout.fnmatch_lines(["*Failed: Timeout >1.0s*"])
+
+
+@have_sigalrm
+def test_both_hard(testdir):
+    testdir.makepyfile(
+        """
+        import signal
+        import time
+
+        def test_foo():
+
+            def handler(signum, frame):
+                time.sleep(2)
+
+            # so that the signal method does not succeed
+            signal.signal(signal.SIGALRM, handler)
+            time.sleep(2)
+        """
+    )
+    result = testdir.runpytest(
+        "--timeout=1", "--timeout-method=both", "--timeout-kill-delay=1"
+    )
+    result.stderr.fnmatch_lines(
+        [
+            "*++ Timeout ++*",
+            "*~~ Stack of MainThread* ~~*",
+            "*File *, line *, in *",
+            "*++ Timeout ++*",
+        ]
+    )
+    assert "++ Timeout ++" in result.stderr.lines[-1]
+
+
 @pytest.mark.skipif(
     hasattr(sys, "pypy_version_info"), reason="pypy coverage seems broken currently"
 )
