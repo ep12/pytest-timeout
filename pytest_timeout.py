@@ -17,6 +17,7 @@ from distutils.version import LooseVersion
 
 import py
 import pytest
+from _pytest.runner import runtestprotocol
 
 
 HAVE_SIGALRM = hasattr(signal, "SIGALRM")
@@ -43,11 +44,18 @@ used in the test.
 KILL_DELAY_DESC = """
 Delay between sending SIGALRM and killing the run using a timer thread.
 """.strip()
+TIMING_DESC = """
+Inline timing information. 'off' (default) means no timing information,
+'short' prints the overall duration, 'long' prints separate contributions
+from the setup, call and teardown phases.
+"""
 
 # bdb covers pdb, ipdb, and possibly others
 # pydevd covers PyCharm, VSCode, and possibly others
 KNOWN_DEBUGGING_MODULES = {"pydevd", "bdb"}
-Settings = namedtuple("Settings", ["timeout", "method", "func_only", "kill_delay"])
+Settings = namedtuple(
+    "Settings", ["timeout", "method", "func_only", "kill_delay", "timing"]
+)
 
 
 @pytest.hookimpl
@@ -72,10 +80,14 @@ def pytest_addoption(parser):
         help=METHOD_DESC,
     )
     group.addoption("--timeout-kill-delay", type=float, help=KILL_DELAY_DESC)
+    group.addoption(
+        "--timeout-timing", choices=["off", "short", "long"], help=TIMING_DESC
+    )
     parser.addini("timeout", TIMEOUT_DESC)
     parser.addini("timeout_method", METHOD_DESC)
     parser.addini("timeout_func_only", FUNC_ONLY_DESC, type="bool")
     parser.addini("timeout_kill_delay", KILL_DELAY_DESC)
+    parser.addini("timeout_timing", TIMING_DESC)
 
 
 @pytest.hookimpl
@@ -97,10 +109,11 @@ def pytest_configure(config):
     config._env_timeout_method = settings.method
     config._env_timeout_func_only = settings.func_only
     config._env_timeout_kill_delay = settings.kill_delay
+    config._env_timeout_timing = settings.timing
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_protocol(item):
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_protocol(item, nextitem):
     """Hook in timeouts to the runtest protocol.
 
     If the timeout is set on the entire test, including setup and
@@ -108,11 +121,28 @@ def pytest_runtest_protocol(item):
     pytest_runtest_call is used.
     """
     func_only = get_func_only_setting(item)
+    ihook = item.ihook
+    ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+
     if func_only is False:
         timeout_setup(item)
-    yield
+    reports = runtestprotocol(item, log=False, nextitem=nextitem)
     if func_only is False:
         timeout_teardown(item)
+
+    if reports:
+        timings = []
+        for report in reports:
+            timings.append(getattr(report, "duration", 0.0))
+            if any(
+                [report.failed, report.skipped, getattr(report, "timed_out", False)]
+            ):
+                break
+        report.timings = timings
+        report.timeout_timing = item.config._env_timeout_timing
+        ihook.pytest_runtest_logreport(report=report)
+    ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+    return True
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -137,13 +167,14 @@ def pytest_report_header(config):
         return [
             (
                 "timeout: %ss\ntimeout method: %s\ntimeout func_only: %s\n"
-                "timeout kill_delay: %s"
+                "timeout kill_delay: %s\ntimeout timing: %s"
             )
             % (
                 config._env_timeout,
                 config._env_timeout_method,
                 config._env_timeout_func_only,
                 config._env_timeout_kill_delay,
+                config._env_timeout_timing,
             )
         ]
 
@@ -185,6 +216,65 @@ def pytest_enter_pdb():
     # need another way to signify that the timeout should not be performed.
     global SUPPRESS_TIMEOUT
     SUPPRESS_TIMEOUT = True
+
+
+def _fmt_num(num: float, sig_digits: int = 3):
+    """Format num with sig_digits digits."""
+    a, b = str(int(num)), str(num - int(num))[1:]
+    i_b = max(0, sig_digits - len(a))
+    if i_b > 0:
+        i_b += 1
+    return a + b[:i_b]
+
+
+def _fmt_time(t: float):
+    if not isinstance(t, (int, float)):
+        return str(t)
+    if t > 1:
+        return _fmt_num(t) + "s"
+    if t > 1e-3:
+        return _fmt_num(1e3 * t) + "ms"
+    if t > 1e-6:
+        return _fmt_num(1e6 * t) + "µs"
+    return _fmt_num(1e9 * t) + "ns"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_report_teststatus(report, **kwargs):
+    """Report test run duration.
+
+    Adapted from
+    https://github.com/pytest-dev/pytest/blob/38d8deb74d95077ebf189440ca047e14f8197da1/src/_pytest/runner.py#L202
+    """
+    if report.skipped:
+        if hasattr(report, "wasxfail"):
+            return None  # XFAILs cause problems with "skipped", "S", "SKIPPED"
+        return "skipped", "S", "SKIPPED"
+    timing = getattr(report, "timeout_timing", "off")
+    if timing in ("off", "", "false", "False", None):
+        return (  # This really could be 3 lines, but the linter doesn't allow that.
+            ("passed", ".", "PASSED")
+            if report.passed
+            else (
+                ("failed", "T", "TIMEOUT")
+                if getattr(report, "timed_out", False)
+                else (("failed", "F", "FAILED") if report.failed else None)
+            )
+        )
+    timings = getattr(report, "timings", [])
+    if not hasattr(timings, "__iter__") or len(timings) <= 1:
+        d = _fmt_time(getattr(report, "duration", 0.0))
+    else:
+        d = _fmt_time(sum(timings))
+        if timing == "long":
+            d = "%s=%s" % ("+".join(map(_fmt_time, timings)), d)
+    if report.passed:
+        return "passed", "P", "PASSED (%s)" % d
+    if getattr(report, "timed_out", False):
+        return "failed", "T", "TIMEOUT (%s)" % d
+    if report.failed:
+        return "failed", "F", "FAILED (%s)" % d
+    return None
 
 
 def is_debugging(trace_func=None):
@@ -325,7 +415,15 @@ def get_env_settings(config):
         ini = config.getini("timeout_kill_delay")
         if ini:
             kill_delay = _validate_timeout(ini, "config file", name="kill_delay")
-    return Settings(timeout, method, func_only or False, kill_delay)
+
+    timing = config.getvalue("timeout_timing")
+    if timing is None:
+        timing = os.environ.get("PYTEST_TIMEOUT_TIMING")
+    if timing is None:
+        timing = config.getini("timeout_timing")
+    if timing is None:
+        timing = "off"
+    return Settings(timeout, method, func_only or False, kill_delay, timing)
 
 
 def get_func_only_setting(item):
@@ -363,7 +461,9 @@ def get_params(item, marker=None):
         kill_delay = item.config._env_timeout_kill_delay
     if method == "both" and (kill_delay is None or kill_delay <= 0):
         method = DEFAULT_METHOD
-    return Settings(timeout, method, func_only, kill_delay)
+    return Settings(
+        timeout, method, func_only, kill_delay, item.config._env_timeout_timing
+    )
 
 
 def _parse_marker(marker):
@@ -404,7 +504,7 @@ def _parse_marker(marker):
         func_only = None
     if kill_delay is NOTSET:
         kill_delay = None
-    return Settings(timeout, method, func_only, kill_delay)
+    return Settings(timeout, method, func_only, kill_delay, None)
 
 
 def _validate_timeout(timeout, where, name: str = "timeout"):
